@@ -48,7 +48,7 @@ else:
     # Retry transport and file IO errors.
     RETRYABLE_ERRORS = (httplib2.HttpLib2Error, IOError)
 
-# Number of times to retry failed downloads.
+# Number of times to retry GCS operations.
 NUM_RETRIES = 5
 
 # Number of bytes to send/receive in each request.
@@ -134,7 +134,7 @@ class GCSClient(luigi.target.FileSystem):
 
     def _obj_exists(self, bucket, obj):
         try:
-            self.client.objects().get(bucket=bucket, object=obj).execute()
+            self.client.objects().get(bucket=bucket, object=obj).execute(num_retries=NUM_RETRIES)
         except errors.HttpError as ex:
             if ex.resp['status'] == '404':
                 return False
@@ -144,7 +144,7 @@ class GCSClient(luigi.target.FileSystem):
 
     def _list_iter(self, bucket, prefix):
         request = self.client.objects().list(bucket=bucket, prefix=prefix)
-        response = request.execute()
+        response = request.execute(num_retries=NUM_RETRIES)
 
         while response is not None:
             for it in response.get('items', []):
@@ -154,14 +154,14 @@ class GCSClient(luigi.target.FileSystem):
             if request is None:
                 break
 
-            response = request.execute()
+            response = request.execute(num_retries=NUM_RETRIES)
 
     def _do_put(self, media, dest_path):
         bucket, obj = self._path_to_bucket_and_key(dest_path)
 
         request = self.client.objects().insert(bucket=bucket, name=obj, media_body=media)
         if not media.resumable():
-            return request.execute()
+            return request.execute(num_retries=NUM_RETRIES)
 
         response = None
         attempts = 0
@@ -201,7 +201,7 @@ class GCSClient(luigi.target.FileSystem):
         bucket, obj = self._path_to_bucket_and_key(path)
         if self._is_root(obj):
             try:
-                self.client.buckets().get(bucket=bucket).execute()
+                self.client.buckets().get(bucket=bucket).execute(num_retries=NUM_RETRIES)
             except errors.HttpError as ex:
                 if ex.resp['status'] == '404':
                     return False
@@ -212,7 +212,7 @@ class GCSClient(luigi.target.FileSystem):
             return True
 
         # Any objects with this prefix
-        resp = self.client.objects().list(bucket=bucket, prefix=obj, maxResults=20).execute()
+        resp = self.client.objects().list(bucket=bucket, prefix=obj, maxResults=20).execute(num_retries=NUM_RETRIES)
         lst = next(iter(resp.get('items', [])), None)
         return bool(lst)
 
@@ -224,7 +224,7 @@ class GCSClient(luigi.target.FileSystem):
                 'Cannot delete root of bucket at path {}'.format(path))
 
         if self._obj_exists(bucket, obj):
-            self.client.objects().delete(bucket=bucket, object=obj).execute()
+            self.client.objects().delete(bucket=bucket, object=obj).execute(num_retries=NUM_RETRIES)
             _wait_for_consistency(lambda: not self._obj_exists(bucket, obj))
             return True
 
@@ -233,10 +233,25 @@ class GCSClient(luigi.target.FileSystem):
                 raise InvalidDeleteException(
                     'Path {} is a directory. Must use recursive delete'.format(path))
 
+            # manual retries because BatchHttpRequest does not support it
             req = http.BatchHttpRequest()
             for it in self._list_iter(bucket, self._add_path_delimiter(obj)):
                 req.add(self.client.objects().delete(bucket=bucket, object=it['name']))
-            req.execute()
+
+            attempts = 0
+            while attempts < NUM_RETRIES:
+                attempts += 1
+                try:
+                    req.execute()
+                    break
+                except errors.HttpError as err:
+                    if err.resp.status < 500 or attempts >= NUM_RETRIES:
+                        raise
+                    logger.warning('Error removing files, retrying', exc_info=True)
+                except RETRYABLE_ERRORS:
+                    if attempts >= NUM_RETRIES:
+                        raise
+                    logger.warning('Error removing files, retrying', exc_info=True)
 
             _wait_for_consistency(lambda: not self.isdir(path))
             return True
@@ -289,7 +304,7 @@ class GCSClient(luigi.target.FileSystem):
                     sourceObject=src_prefix + suffix,
                     destinationBucket=dest_bucket,
                     destinationObject=dest_prefix + suffix,
-                    body={}).execute()
+                    body={}).execute(num_retries=NUM_RETRIES)
                 copied_objs.append(dest_prefix + suffix)
 
             _wait_for_consistency(
@@ -301,7 +316,7 @@ class GCSClient(luigi.target.FileSystem):
                 sourceObject=src_obj,
                 destinationBucket=dest_bucket,
                 destinationObject=dest_obj,
-                body={}).execute()
+                body={}).execute(num_retries=NUM_RETRIES)
             _wait_for_consistency(lambda: self._obj_exists(dest_bucket, dest_obj))
 
     def rename(self, *args, **kwargs):
@@ -341,7 +356,7 @@ class GCSClient(luigi.target.FileSystem):
             return_fp = _DeleteOnCloseFile(fp.name, 'r')
 
             # Special case empty files because chunk-based downloading doesn't work.
-            result = self.client.objects().get(bucket=bucket, object=obj).execute()
+            result = self.client.objects().get(bucket=bucket, object=obj).execute(num_retries=NUM_RETRIES)
             if int(result['size']) == 0:
                 return return_fp
 
